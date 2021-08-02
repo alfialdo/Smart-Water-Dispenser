@@ -2,6 +2,7 @@ import pandas as pd
 import seaborn as sns
 import matplotlib
 import matplotlib.pyplot as plt
+import matplotlib.lines as mlines
 from matplotlib import dates
 from datetime import datetime as dt
 
@@ -19,6 +20,7 @@ import numpy as np
 import datetime
 import glob
 import time
+
 
 
 class DispenserBehavior():
@@ -73,21 +75,33 @@ class DispenserBehavior():
     
     """Method for windowing the data with some time steps"""
     
-    def data_windowing(self, data, n_steps):
-        X, y = list(), list()
-        for i in range(len(data)):
-            # find the end of this pattern
-            end_ix = i + n_steps
-            # check if we are beyond the dataset
-            if end_ix > len(data)-1:
-                break
-            # gather input and output parts of the pattern
-            seq_x, seq_y = data[i:end_ix, :], data[end_ix, :]
-            X.append(seq_x)
-            y.append(seq_y)
+    def data_windowing(self, data, n_steps, labels = None):
+        temp_X, temp_y = list(), list()
+        
+        if labels.all() != None:
+            for i in range(len(data)):
+                end_ix = i + n_steps
+
+                if end_ix > len(data)-1:
+                    break
+
+                seq_x, seq_y = data[i:end_ix, :], labels[end_ix]
+                temp_X.append(seq_x)
+                temp_y.append(seq_y)
+        else:
+            for i in range(len(data)):
+                # find the end of this pattern
+                end_ix = i + n_steps
+                # check if we are beyond the dataset
+                if end_ix > len(data)-1:
+                    break
+                # gather input and output parts of the pattern
+                seq_x, seq_y = data[i:end_ix, :], data[end_ix, :]
+                temp_X.append(seq_x)
+                temp_y.append(seq_y)
             
-        self.X = np.array(X)
-        self.y = np.array(y)
+        self.X = np.array(temp_X)
+        self.y = np.array(temp_y)
         
         print('Shape of input features (X variable): ', self.X.shape)
         print('Shape of labels (y variable): ', self.y.shape)
@@ -102,7 +116,9 @@ class DispenserBehavior():
         if val_size != 0:        
             train_index = int(self.X.shape[0]*train_size) 
             val_index = int(self.X.shape[0]*val_size)
-
+            self.train_index = train_index        
+            self.val_index = val_index
+            
             self.X_train = self.X[:train_index]
             self.X_val = self.X[train_index:train_index+val_index]
             self.X_test = self.X[train_index+val_index:]
@@ -115,7 +131,9 @@ class DispenserBehavior():
             
         else:
             train_index = int(self.X.shape[0]*train_size)         
-
+            self.train_index = train_index
+            self.val_index = None
+            
             self.X_train = self.X[:train_index]
             self.X_val = None
             self.X_test = self.X[train_index:]
@@ -124,14 +142,13 @@ class DispenserBehavior():
             self.y_val = None
             self.y_test = self.y[train_index:]
             
-
         print('X_train:',self.X_train.shape, '| y_train:', self.y_train.shape)
         print('X_test:', self.X_test.shape, '| y_test:', self.y_test.shape)
 
         
     """Method for training the dataset with some hyperparameter"""
     
-    def train(self, epochs, lstm_units = 15, dropout = 0.4, dense_units = 30, l2_decay = 0.1, loss_func = 'mean_absolute_error', patience = 10, verbose = 1):
+    def train(self, epochs, output, lstm_units = 15, dropout = 0.4, dense_units = 30, l2_decay = 0.1, loss_func = 'mean_absolute_error', patience = 10, verbose = 1):
         
         n_steps = self.X.shape[1]
         n_features = self.X.shape[2]
@@ -140,7 +157,7 @@ class DispenserBehavior():
         self.LSTM_model.add(LSTM(units = lstm_units, activation='relu', input_shape=(n_steps, n_features)))    
         self.LSTM_model.add(Dropout(dropout))
         self.LSTM_model.add(Dense(dense_units, kernel_regularizer = regularizers.l2(l2_decay)))
-        self.LSTM_model.add(Dense(n_features))
+        self.LSTM_model.add(Dense(output))
         self.LSTM_model.compile(optimizer = 'adam', loss = loss_func)
 
         es = EarlyStopping(monitor='val_loss', mode='min', verbose=1, patience = patience)
@@ -165,20 +182,50 @@ class DispenserBehavior():
         self.LSTM_model.evaluate(self.X_test, self.y_test)
         print('Training time %.3f seconds' % self.training_time)
     
-    def predict_and_compare(self, test_input, y_val = None):
+    """ Method for predicting and compare the prediction result with labels"""
+    
+    
+    def predict_and_compare(self, test_input, test_labels):
         
-        yhat = self.LSTM_model.predict(test_input)
+        yhat = self.LSTM_model.predict(model.X_test)
         yhat = self.scaler.inverse_transform(yhat)
-        
-        if y_val == None:
-            result = {
-                'Predicted features' : yhat[0].astype('int64'),
-            }
-            
-        else:
-            result = {
-                'Predicted features' : yhat[0].astype('int64'),
-                'Original features' : y_val[0].astype('int64')
-            }
 
-        self.pred_table = pd.DataFrame.from_dict(result, orient = 'index', columns = list(self.data_resampled.columns[1:]))
+        if self.y.shape[1] == 1:
+            self.predicted_values = list(yhat.flatten().astype('int64'))
+        else:
+            self.predicted_values = yhat
+        
+        self.__plot_prediction(yhat, test_labels)
+    
+    """ Method for plotting the prediction result """"
+    
+    def __plot_prediction(self, yhat, y_val):
+    
+        fig, ax = plt.subplots(3, 1, figsize=(18, 15))
+        fig.suptitle('Water Usage Prediction')
+
+        if self.val_index != None:
+            time_steps = list(self.data_resampled.iloc[self.train_index + self.val_index + self.X.shape[1]:].UploadTime)
+        else:
+            time_steps = list(self.data_resampled.iloc[(self.train_index + self.X.shape[1]):].UploadTime)
+
+        index = int(0.33*len(time_steps))
+
+        predicted_marker = mlines.Line2D([], [], marker='.', linestyle='None',
+                              markersize=10, label='Actual')
+        actual_marker = mlines.Line2D([], [], color='orange', marker='X', linestyle='None',
+                              markersize=10, label='Predicted')
+
+        for i in range(0, 3):
+            ax[i].set_xlabel('Time Steps [30m]\n')
+            ax[i].set_ylabel('Water Usage')
+            ax[i].legend(handles = [actual_marker, predicted_marker])
+
+            if i == 2:
+                ax[i].plot(time_steps[i*index:], y_val[i*index:], linestyle = '-', marker = '.', markersize = 10)
+                ax[i].plot(time_steps[i*index:], yhat[i*index:], color='orange', linestyle = '', marker = 'X', markersize = 8)
+
+            else:
+                ax[i].plot(time_steps[i*index:(i+1)*index], y_val[i*index:(i+1)*index], linestyle = '-', marker = '.', markersize = 10)
+                ax[i].plot(time_steps[i*index:(i+1)*index], yhat[i*index:(i+1)*index], color='orange', linestyle = '', marker = 'X', markersize = 8)
+
