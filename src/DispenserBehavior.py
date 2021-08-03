@@ -14,7 +14,7 @@ from sklearn.preprocessing import StandardScaler, MinMaxScaler
 import tensorflow as tf
 from tensorflow.keras.layers import LSTM, GRU, Dense, Dropout
 from tensorflow.keras.callbacks import EarlyStopping
-from tensorflow.keras import regularizers
+from tensorflow.keras import regularizers, optimizers
 
 import numpy as np
 import datetime
@@ -24,9 +24,10 @@ import time
 
 
 class DispenserBehavior():
-    def __init__(self, data, resample_interval = '30T', scaler = 'standardize'):
+    def __init__(self, data, resample_interval = '30T', scaler = 'standardize', adjust_seasonality = False):
         self.data = data.copy()
         self.resample_interval = resample_interval
+        self.adjust_seasonality = adjust_seasonality
 
         if scaler == 'standardize':
             self.scaler = StandardScaler()
@@ -55,6 +56,26 @@ class DispenserBehavior():
         # Scaling the data with normalization / standardization
         df_numpy = self.data_resampled.drop(columns = ['UploadTime']).to_numpy()
         self.data_rescaled = self.scaler.fit_transform(df_numpy)
+        
+        if self.adjust_seasonality:
+            filtered = savgol_filter(self.data_resampled['Usage_CC'], window_length=13, polyorder=4)
+            UploadTime = list(self.data_resampled.UploadTime)
+            fig, ax = plt.subplots()
+            ax.plot(UploadTime, self.data_resampled['Usage_CC'], '--r', label='Original')
+            ax.plot(UploadTime, filtered, '-b', label='Smoothed')
+            plt.xlabel('Upload Time')
+            plt.ylabel('Usage_CC')
+            plt.title('Data Smoothing', fontsize=20)
+            ax.legend()
+            plt.show()
+            
+            self.diff = list()
+            for i in range(len(self.data_resampled['Usage_CC'])):
+                value = self.data_resampled['Usage_CC'][i] - filtered[i]
+                self.diff.append(value)
+            plt.plot(self.diff)
+            plt.title('Deseasonalized Dataset')
+            plt.show()
         
         
     def __calculate_usage(self, cc, l, mt):
@@ -127,7 +148,10 @@ class DispenserBehavior():
             self.y_val = self.y[train_index:train_index+val_index]
             self.y_test = self.y[train_index+val_index:]
             
+            self.last_data = list(self.data_resampled.iloc[self.train_index + self.val_index + self.X.shape[1]:].UploadTime)
+            
             print('X_val:', self.X_val.shape, '| y_val:', self.y_val.shape)
+            
             
         else:
             train_index = int(self.X.shape[0]*train_size)         
@@ -142,74 +166,101 @@ class DispenserBehavior():
             self.y_val = None
             self.y_test = self.y[train_index:]
             
+            self.last_data = list(self.data_resampled.iloc[self.train_index + self.X.shape[1]:].UploadTime)
+            
         print('X_train:',self.X_train.shape, '| y_train:', self.y_train.shape)
         print('X_test:', self.X_test.shape, '| y_test:', self.y_test.shape)
 
         
     """Method for training the dataset with some hyperparameter"""
     
-    def train(self, epochs, output, lstm_units = 15, dropout = 0.4, dense_units = 30, l2_decay = 0.1, loss_func = 'mean_absolute_error', patience = 10, verbose = 1):
+    def train(self, epochs, output, 
+              lstm_units = 15, 
+              dropout = 0.4, 
+              dense_units = 30, 
+              l2_decay = 0.1, 
+              loss_func = 'mean_absolute_error', 
+              patience = 10, 
+              verbose = 1, 
+              lr = 0.01):
         
         n_steps = self.X.shape[1]
         n_features = self.X.shape[2]
         
-        self.LSTM_model = tf.keras.Sequential()
-        self.LSTM_model.add(LSTM(units = lstm_units, activation='relu', input_shape=(n_steps, n_features)))    
-        self.LSTM_model.add(Dropout(dropout))
-        self.LSTM_model.add(Dense(dense_units, kernel_regularizer = regularizers.l2(l2_decay)))
-        self.LSTM_model.add(Dense(output))
-        self.LSTM_model.compile(optimizer = 'adam', loss = loss_func)
+        self.LSTM_ = tf.keras.Sequential()
+        self.LSTM_.add(LSTM(units = lstm_units, activation='relu', input_shape=(n_steps, n_features)))
+        self.LSTM_.add(Dropout(dropout))
+        self.LSTM_.add(Dense(dense_units, kernel_regularizer = regularizers.l2(l2_decay)))
+        self.LSTM_.add(Dense(output))
+        
+        opt = optimizers.Adam(learning_rate = lr)
+        self.LSTM_.compile(optimizer = opt, loss = loss_func)
 
         es = EarlyStopping(monitor='val_loss', mode='min', verbose=1, patience = patience)
 
         start_time = time.time()
         if self.X_val == None:
-            self.history = self.LSTM_model.fit(self.X_train, self.y_train, validation_data=(self.X_test, self.y_test), callbacks = [es], epochs = epochs, verbose = verbose)
+            self.history = self.LSTM_.fit(self.X_train, self.y_train, validation_data=(self.X_test, self.y_test), callbacks = [es], epochs = epochs, verbose = verbose)
         else:
-            self.history = self.LSTM_model.fit(self.X_train, self.y_train, validation_data=(self.X_val, self.y_val), callbacks = [es], epochs= epochs, verbose = verbose)
+            self.history = self.LSTM_.fit(self.X_train, self.y_train, validation_data=(self.X_val, self.y_val), callbacks = [es], epochs= epochs, verbose = verbose)
         self.training_time = time.time() - start_time
         
         print('\n\n\n============================\nTraining and testing evaluation: \n')
         
         plt.plot(self.history.history['loss'])
         plt.plot(self.history.history['val_loss'])
-        plt.title('Model loss')
+        plt.title(' loss')
         plt.ylabel('Loss')
         plt.xlabel('Epochs')
         plt.legend(['Train', 'Test'])
         plt.show()
         
-        self.LSTM_model.evaluate(self.X_test, self.y_test)
+        self.LSTM_.evaluate(self.X_test, self.y_test)
         print('Training time %.3f seconds' % self.training_time)
     
     """ Method for predicting and compare the prediction result with labels"""
     
-    
     def predict_and_compare(self, test_input, test_labels):
         
-        yhat = self.LSTM_model.predict(model.X_test)
+        yhat = self.LSTM_.predict(test_input)
         yhat = self.scaler.inverse_transform(yhat)
-
+        
         if self.y.shape[1] == 1:
-            self.predicted_values = list(yhat.flatten().astype('int64'))
-        else:
+            if self.adjust_seasonality:
+                yhat = self.retransform(yhat)
+                    
+#             self.predicted_values = list(yhat.flatten().astype('int64'))
             self.predicted_values = yhat
+        else:
+            self.predicted_values = yhat.flatten().astype('int64')
         
         self.__plot_prediction(yhat, test_labels)
     
-    """ Method for plotting the prediction result """"
+    """Method to retransform deseasonalized dataset into original one"""
+    
+    def retransform(self, yhat):
+
+        # find the water usage in one cycle ago
+        original_val = list()
+        df = self.data_resampled
+        
+        for transformed_val, data in zip(yhat.flatten().astype('int64'), self.last_data):
+            last_val = df[df.UploadTime + datetime.timedelta(days=7) == data].Usage_CC.values[0]
+            original_val.append(transformed_val + last_val)
+            
+
+        return original_val
+        
+    
+    
+    """ Method for plotting the prediction result """
     
     def __plot_prediction(self, yhat, y_val):
     
         fig, ax = plt.subplots(3, 1, figsize=(18, 15))
         fig.suptitle('Water Usage Prediction')
 
-        if self.val_index != None:
-            time_steps = list(self.data_resampled.iloc[self.train_index + self.val_index + self.X.shape[1]:].UploadTime)
-        else:
-            time_steps = list(self.data_resampled.iloc[(self.train_index + self.X.shape[1]):].UploadTime)
-
-        index = int(0.33*len(time_steps))
+        index = int(0.33*len(self.last_data))
 
         predicted_marker = mlines.Line2D([], [], marker='.', linestyle='None',
                               markersize=10, label='Actual')
@@ -222,10 +273,10 @@ class DispenserBehavior():
             ax[i].legend(handles = [actual_marker, predicted_marker])
 
             if i == 2:
-                ax[i].plot(time_steps[i*index:], y_val[i*index:], linestyle = '-', marker = '.', markersize = 10)
-                ax[i].plot(time_steps[i*index:], yhat[i*index:], color='orange', linestyle = '', marker = 'X', markersize = 8)
+                ax[i].plot(self.last_data[i*index:], y_val[i*index:], linestyle = '-', marker = '.', markersize = 10)
+                ax[i].plot(self.last_data[i*index:], yhat[i*index:], color='orange', linestyle = '', marker = 'X', markersize = 8)
 
             else:
-                ax[i].plot(time_steps[i*index:(i+1)*index], y_val[i*index:(i+1)*index], linestyle = '-', marker = '.', markersize = 10)
-                ax[i].plot(time_steps[i*index:(i+1)*index], yhat[i*index:(i+1)*index], color='orange', linestyle = '', marker = 'X', markersize = 8)
+                ax[i].plot(self.last_data[i*index:(i+1)*index], y_val[i*index:(i+1)*index], linestyle = '-', marker = '.', markersize = 10)
+                ax[i].plot(self.last_data[i*index:(i+1)*index], yhat[i*index:(i+1)*index], color='orange', linestyle = '', marker = 'X', markersize = 8)
 
